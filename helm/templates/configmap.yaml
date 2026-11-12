@@ -1,0 +1,17 @@
+{{- include "trading.checkPorts" . -}}
+{{- include "trading.checkClientIds" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "trading.fullname" . }}
+  labels:
+    {{- include "trading.labels" . | nindent 4 }}
+data:
+  PORT: {{ .Values.service.port | quote }}
+  INTERNAL_PORT: {{ .Values.service.internalPort | quote }}
+  GRPC_PORT: {{ .Values.service.grpcPort | quote }}
+  METRICS_PORT: {{ .Values.metrics.port | quote }}
+  RUNTIME_CONFIG_FILE: {{ include "trading.runtimeFile" . | quote }}
+  {{- range $key, $value := .Values.env }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}

@@ -1,0 +1,870 @@
+openapi: 3.1.0
+info:
+  title: Chance trading API
+  version: 0.2.0
+  description: |
+    Credits, positions and trades of one tenant: quotes, buy orders and sales (UC-08) against the market maker's
+    offers, and the portfolio (balance, positions, recent trades and payouts; tenant admins also see the markets they
+    funded).
+
+    - Every endpoint except the health probes needs a bearer JWT issued by the identity provider.
+    - The tenant of the caller comes only from the token (claim `organization`), never from the request. A market of
+      another tenant answers `404`, exactly like a market that does not exist.
+    - Roles (token contract v2): `trader` and `tenant-admin` are the caller's group in the token's organization,
+      `organization.<alias>.groups`, which must hold exactly one entry, `/trader` or `/tenant-admin`. A `platform-admin`
+      (a realm role) sees no tenant's data and gets `403` on every trading endpoint, and so does a token without a
+      tenant or without exactly one valid group (none, both, an unknown one); a realm role `trader` or `tenant-admin`
+      counts for nothing. Orders and sales are for traders only: tenant admins resolve the markets, so they do not
+      trade (`403`, plan question 9).
+    - **Units.** `amount` is whole credits (1 credit = 1 EUR cent, payments' unit). Every other quantity is an exact
+      integer in micro-units: `...Micro` money fields are microcredits (1 credit = 1 000 000), share fields are
+      microshares (1 share = 1 000 000; a winning share pays 1 credit), prices are microcredits per share
+      (`550000` = 0.55). A buy spends exactly its `amount`; a sale gives up exactly its `sharesMicro`; the cheapest
+      offers fill first; any rounding favours the market's bot account by less than one microunit per fill.
+    - Errors are RFC 9457 `application/problem+json` with a stable `code`; the problem `type` is
+      `urn:chance:problem:<code with dashes>`. Some problems carry extension members (`maxAmount`, `quote`, ...).
+    - A token that is wrong is answered `401`. Every authenticated endpoint may answer `503` with `Retry-After`
+      (`identity_provider_unavailable`, `tenant_not_ready`, and for orders `orders_paused` and `concurrent_update`).
+    - Every API answer carries `Cache-Control: private, no-store` (plan INF-02) and `X-Correlation-Id`.
+    - The gateway routes the prefix `/v1/trading`; `/v1/internal` (the internal port, `internal.openapi.yaml`) and the
+      health paths are not routed by the gateway.
+servers:
+  - url: http://localhost:8080
+    description: Local run (the public port; the internal API listens on its own port)
+tags:
+  - name: Trading
+    description: Quotes, orders, sales and the portfolio of the caller
+  - name: Health
+    description: Kubernetes probes
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/trading/quote:
+    get:
+      tags: [Trading]
+      operationId: getQuote
+      summary: What a buy of `amount` credits would get now
+      description: |
+        Computed from the market maker's resting offers, cheapest first, without any change. Traders and tenant admins.
+        A quote is not a promise: the next trade changes the book (use `maxAveragePriceMicro` on the order, DM-18).
+      parameters:
+        - name: marketId
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/Side'
+        - name: amount
+          in: query
+          required: true
+          description: Whole credits to spend
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000000
+      responses:
+        '200':
+          description: The quote
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Quote'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/TradeConflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/trading/orders:
+    post:
+      tags: [Trading]
+      operationId: placeOrder
+      summary: Buy YES or NO shares for `amount` credits (traders only)
+      description: |
+        A market order that takes the cheapest offers first and spends exactly `amount`, in one transaction, or nothing
+        (fill or kill). Trading checks its own copy of the market: it must be open and before its close time.
+        `Idempotency-Key` is required (REL-03): the same key with the same body answers the stored result with `200` and
+        buys nothing again; with another body `422`. A refused order (any 4xx) is not stored under the key, so a repeat
+        is decided anew. The answer carries the new balance, the position and the market's trade sequence (DM-17).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderRequest'
+      responses:
+        '201':
+          description: Bought now
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '200':
+          description: A repeat of a completed Idempotency-Key with the same body; nothing was bought again
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/TradeConflict'
+        '422':
+          description: The Idempotency-Key was used before with another body (code `idempotency_key_reused`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/trading/sale-quote:
+    get:
+      tags: [Trading]
+      operationId: getSaleQuote
+      summary: What a sale of `sharesMicro` shares of `side` would return now (UC-08)
+      description: |
+        A sale of S shares of one side buys S shares of the other side from the market maker's offers, cheapest first,
+        and redeems the S pairs for S microcredits (a YES and a NO share always pay 1 credit together); the proceeds are
+        S minus what the other side's shares cost. Computed without any change; it does not look at the caller's
+        position. Traders and tenant admins. The buy quote (`/v1/trading/quote`) is unchanged. A quote is not a promise:
+        the next trade changes the book (use `minProceedsMicro` on the sale).
+      parameters:
+        - name: marketId
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/Side'
+        - name: sharesMicro
+          in: query
+          required: true
+          description: Microshares of `side` to sell
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 9007199254740991
+      responses:
+        '200':
+          description: The sale quote
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SaleQuote'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/TradeConflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/trading/sales:
+    post:
+      tags: [Trading]
+      operationId: sellShares
+      summary: Sell `sharesMicro` shares of `side` before the market closes (traders only, UC-08)
+      description: |
+        Buys the same number of shares of the other side from the market maker's offers, cheapest first, fill or kill,
+        and redeems the pairs for 1 microcredit each, in one transaction: the position loses `sharesMicro` of `side`
+        and the balance gains `proceedsMicro` = `sharesMicro` - `costMicro`, never negative. The caller must hold at least
+        `sharesMicro` of `side` in the market. Trading checks its own copy of the market: it must be open and before its
+        close time. A sale that would return nothing (or less than `minProceedsMicro`) is refused. `Idempotency-Key` is
+        required (REL-03) and bound to the body: the same key with the same body answers the stored result with `200`
+        and sells nothing again; with another body (also an order's body) `422`. A refused sale (any 4xx) is not stored
+        under the key. The answer carries the new balance, the position and the market's trade sequence (DM-17). The
+        runtime setting `ORDERS_ENABLED=false` pauses sales as it pauses orders.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SaleRequest'
+      responses:
+        '201':
+          description: Sold now
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '200':
+          description: A repeat of a completed Idempotency-Key with the same body; nothing was sold again
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sale'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/TradeConflict'
+        '422':
+          description: The Idempotency-Key was used before with another body (code `idempotency_key_reused`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/trading/portfolio:
+    get:
+      tags: [Trading]
+      operationId: getPortfolio
+      summary: Balance, positions, recent trades and payouts of the caller
+      description: |
+        From trading's own projections (DM-12): the market question comes from trading's copy of the market; current
+        prices are not here (the UI asks market-data in one batch call). A user without an account sees zeros.
+        Tenant admins also get `fundedMarkets`: the markets they funded and what came back at resolution (UC-06).
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Entries of `recentTrades` and of `payouts`, newest first
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: The portfolio
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Portfolio'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /health/startup:
+    get:
+      tags: [Health]
+      operationId: healthStartup
+      summary: Startup probe
+      description: Answers once the service has applied its migrations and listens on both ports.
+      security: []
+      responses:
+        '200':
+          description: Started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: healthReady
+      summary: Readiness probe
+      description: |
+        Pings the service's own database only (always ready with in-memory stores); NATS and the identity provider are
+        not checked. Answers 503 from the moment the process gets SIGTERM until it exits.
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: The database does not answer (`not_ready`), or the service is shutting down (`shutting_down`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: healthLive
+      summary: Liveness probe
+      description: Process only. It never touches the database.
+      security: []
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT from the identity provider, verified against its JWKS (issuer, audience and signature; `exp` required).
+        The tenant is the single organization alias in the `organization` claim (the tenant id, a UUID; several
+        organizations in one token are `401`). The role is that organization's one group in
+        `organization.<alias>.groups`: `/tenant-admin` or `/trader`. `platform-admin` is a realm role in
+        `realm_access.roles`.
+
+  headers:
+    CacheControl:
+      description: Always `private, no-store`
+      schema:
+        type: string
+        const: private, no-store
+
+  parameters:
+    Side:
+      name: side
+      in: query
+      required: true
+      schema:
+        $ref: '#/components/schemas/Side'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Chosen by the client per order or sale (a UUID is a good choice); 8 to 128 visible ASCII characters. One key
+        names one request of the caller: orders and sales share the caller's keys.
+      schema:
+        type: string
+        pattern: '^[\x21-\x7e]{8,128}$'
+
+  responses:
+    BadRequest:
+      description: The request is invalid (code `validation_failed`, also a missing Idempotency-Key); `errors` names the fields
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: The bearer token is missing or invalid
+      headers:
+        WWW-Authenticate:
+          description: Bearer challenge
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: |
+        The token lacks the required role, is a platform admin's or has no tenant; or (orders) it is a tenant admin's
+        (code `forbidden`)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Trading knows no such market in the caller's tenant (code `not_found`)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TradeConflict:
+      description: |
+        The order or the sale cannot be filled now; nothing changed. The code says why:
+        - `market_not_open`: the market is not open yet, closed, resolved, unfunded or past its close time.
+        - `insufficient_credits` (orders): the balance is lower than `amount`; `withdrawableCredits` is the balance in
+          whole credits.
+        - `insufficient_liquidity`: the offers cannot absorb `amount` (orders: `maxAmount` is the largest whole amount
+          they can) or deliver `sharesMicro` of the other side (sales: `maxSharesMicro` is the most they hold).
+        - `price_limit_exceeded` (orders, DM-18): the average price would be above `maxAveragePriceMicro`; `quote` is
+          a fresh quote for the same amount.
+        - `insufficient_shares` (sales): the position holds fewer shares of `side` than `sharesMicro`; `heldMicro` is
+          what it holds.
+        - `proceeds_below_minimum` (sales): the proceeds would be below `minProceedsMicro`, or zero; `proceedsMicro`,
+          `minProceedsMicro` and `quote`, a fresh sale quote for the same shares.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: |
+        Try again after the time in `Retry-After`. The code says why:
+        - `identity_provider_unavailable`: the signing keys cannot be fetched, so the token cannot be checked.
+        - `tenant_not_ready`: the caller's tenant is still being set up in this service.
+        - `orders_paused` (orders and sales): new orders and sales are paused by the runtime setting `ORDERS_ENABLED`.
+        - `concurrent_update` (orders and sales): the accounts kept changing while the request was decided.
+      headers:
+        Retry-After:
+          description: Seconds to wait before the request is repeated
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Side:
+      type: string
+      enum: ['YES', 'NO']
+    Outcome:
+      type: string
+      enum: ['YES', 'NO', 'INVALID']
+    MarketStatus:
+      type: string
+      description: "trading's copy of the market (`funded` means funded, MarketOpened not processed yet)"
+      enum: [funded, open, closed, resolved]
+    Microcredits:
+      type: integer
+      minimum: 0
+      maximum: 9007199254740991
+      description: Microcredits (1 credit = 1 000 000)
+    Microshares:
+      type: integer
+      minimum: 0
+      maximum: 9007199254740991
+      description: Microshares (1 share = 1 000 000)
+    PriceMicro:
+      type: integer
+      minimum: 10000
+      maximum: 990000
+      multipleOf: 10000
+      description: Microcredits per share on the 0.01 grid (0.01 .. 0.99)
+    Fill:
+      type: object
+      required: [priceMicro, sharesMicro, costMicro]
+      properties:
+        priceMicro:
+          $ref: '#/components/schemas/PriceMicro'
+        sharesMicro:
+          $ref: '#/components/schemas/Microshares'
+        costMicro:
+          $ref: '#/components/schemas/Microcredits'
+    Quote:
+      type: object
+      required: [marketId, side, amount, sharesMicro, costMicro, averagePriceMicro, worstPriceMicro, fills, tradeSequence, quotedAt]
+      properties:
+        marketId:
+          type: string
+          format: uuid
+        side:
+          $ref: '#/components/schemas/Side'
+        amount:
+          type: integer
+          minimum: 1
+          description: Whole credits
+        sharesMicro:
+          $ref: '#/components/schemas/Microshares'
+        costMicro:
+          $ref: '#/components/schemas/Microcredits'
+        averagePriceMicro:
+          type: integer
+          minimum: 1
+          description: ceil(cost x 10^6 / shares), microcredits per share
+        worstPriceMicro:
+          $ref: '#/components/schemas/PriceMicro'
+        fills:
+          type: array
+          items:
+            $ref: '#/components/schemas/Fill'
+        tradeSequence:
+          type: integer
+          minimum: 0
+          description: The market's trade sequence the quote was computed on
+        quotedAt:
+          type: string
+          format: date-time
+    OrderRequest:
+      type: object
+      additionalProperties: false
+      required: [marketId, side, amount]
+      properties:
+        marketId:
+          type: string
+          format: uuid
+        side:
+          $ref: '#/components/schemas/Side'
+        amount:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+          description: Whole credits to spend; the runtime setting ORDER_AMOUNT_MAX may set a lower bound (400 above it)
+        maxAveragePriceMicro:
+          type: integer
+          minimum: 1
+          maximum: 999999
+          description: DM-18 price protection; fill only if the average price stays at or below it
+    Position:
+      type: object
+      required: [marketId, yesMicro, noMicro]
+      properties:
+        marketId:
+          type: string
+          format: uuid
+        yesMicro:
+          $ref: '#/components/schemas/Microshares'
+        noMicro:
+          $ref: '#/components/schemas/Microshares'
+    Order:
+      type: object
+      required: [tradeId, marketId, side, amount, sharesMicro, costMicro, averagePriceMicro, worstPriceMicro, fills, tradeSequence, executedAt, balanceMicro, position]
+      properties:
+        tradeId:
+          type: string
+          format: uuid
+        marketId:
+          type: string
+          format: uuid
+        side:
+          $ref: '#/components/schemas/Side'
+        amount:
+          type: integer
+          minimum: 1
+        sharesMicro:
+          $ref: '#/components/schemas/Microshares'
+        costMicro:
+          $ref: '#/components/schemas/Microcredits'
+        averagePriceMicro:
+          type: integer
+          minimum: 1
+        worstPriceMicro:
+          $ref: '#/components/schemas/PriceMicro'
+        fills:
+          type: array
+          items:
+            $ref: '#/components/schemas/Fill'
+        tradeSequence:
+          type: integer
+          minimum: 1
+          description: DM-17, the market's trade sequence after this trade
+        executedAt:
+          type: string
+          format: date-time
+        balanceMicro:
+          $ref: '#/components/schemas/Microcredits'
+        position:
+          $ref: '#/components/schemas/Position'
+    SaleQuote:
+      type: object
+      required: [marketId, side, sharesMicro, proceedsMicro, averagePriceMicro, costMicro, fills, tradeSequence, quotedAt]
+      properties:
+        marketId:
+          type: string
+          format: uuid
+        side:
+          $ref: '#/components/schemas/Side'
+        sharesMicro:
+          $ref: '#/components/schemas/Microshares'
+        proceedsMicro:
+          $ref: '#/components/schemas/Microcredits'
+        averagePriceMicro:
+          type: integer
+          minimum: 0
+          maximum: 999999
+          description: floor(proceeds x 10^6 / shares), microcredits received per share sold
+        costMicro:
+          $ref: '#/components/schemas/Microcredits'
+        fills:
+          type: array
+          description: The levels of the other side bought, cheapest first, priced as the market maker's offers of that side
+          items:
+            $ref: '#/components/schemas/Fill'
+        tradeSequence:
+          type: integer
+          minimum: 0
+          description: The market's trade sequence the quote was computed on
+        quotedAt:
+          type: string
+          format: date-time
+    SaleRequest:
+      type: object
+      additionalProperties: false
+      required: [marketId, side, sharesMicro]
+      properties:
+        marketId:
+          type: string
+          format: uuid
+        side:
+          $ref: '#/components/schemas/Side'
+        sharesMicro:
+          type: integer
+          minimum: 1
+          maximum: 9007199254740991
+          description: Microshares of `side` to sell; the position must hold at least this many
+        minProceedsMicro:
+          type: integer
+          minimum: 1
+          maximum: 9007199254740991
+          description: DM-18's counterpart; sell only if the proceeds are at least this many microcredits
+    Sale:
+      type: object
+      required: [tradeId, marketId, side, sharesMicro, proceedsMicro, averagePriceMicro, costMicro, fills, tradeSequence, executedAt, balanceMicro, position]
+      properties:
+        tradeId:
+          type: string
+          format: uuid
+        marketId:
+          type: string
+          format: uuid
+        side:
+          $ref: '#/components/schemas/Side'
+        sharesMicro:
+          $ref: '#/components/schemas/Microshares'
+        proceedsMicro:
+          type: integer
+          minimum: 1
+          maximum: 9007199254740991
+          description: sharesMicro - costMicro, added to the balance
+        averagePriceMicro:
+          type: integer
+          minimum: 1
+          maximum: 999999
+          description: floor(proceeds x 10^6 / shares), microcredits received per share sold
+        costMicro:
+          $ref: '#/components/schemas/Microcredits'
+        fills:
+          type: array
+          description: The levels of the other side bought, cheapest first, priced as the market maker's offers of that side
+          items:
+            $ref: '#/components/schemas/Fill'
+        tradeSequence:
+          type: integer
+          minimum: 1
+          description: DM-17, the market's trade sequence after this trade
+        executedAt:
+          type: string
+          format: date-time
+        balanceMicro:
+          $ref: '#/components/schemas/Microcredits'
+        position:
+          $ref: '#/components/schemas/Position'
+    PortfolioPosition:
+      allOf:
+        - $ref: '#/components/schemas/Position'
+        - type: object
+          required: [question, status, closeTime]
+          properties:
+            question:
+              type: ['string', 'null']
+            status:
+              oneOf:
+                - $ref: '#/components/schemas/MarketStatus'
+                - type: 'null'
+            closeTime:
+              type: ['string', 'null']
+              format: date-time
+    TradeEntry:
+      type: object
+      required: [tradeId, marketId, kind, side, sharesMicro, costMicro, proceedsMicro, averagePriceMicro, tradeSequence, executedAt]
+      properties:
+        tradeId:
+          type: string
+        marketId:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [buy, sale]
+          description: '`buy`: shares of `side` bought; `sale` (UC-08): shares of `side` sold'
+        side:
+          $ref: '#/components/schemas/Side'
+        sharesMicro:
+          $ref: '#/components/schemas/Microshares'
+        costMicro:
+          $ref: '#/components/schemas/Microcredits'
+        proceedsMicro:
+          description: A sale's proceeds (sharesMicro - costMicro, what it added to the balance); null for a buy
+          oneOf:
+            - $ref: '#/components/schemas/Microcredits'
+            - type: 'null'
+        averagePriceMicro:
+          type: integer
+          minimum: 1
+          description: A buy, ceil(cost x 10^6 / shares) paid per share; a sale, floor(proceeds x 10^6 / shares) received per share
+        tradeSequence:
+          type: integer
+          minimum: 1
+        executedAt:
+          type: string
+          format: date-time
+    PayoutEntry:
+      type: object
+      required: [marketId, kind, amountMicro, outcome, paidAt]
+      properties:
+        marketId:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [winnings, refund, returned]
+          description: |
+            `winnings`: winning shares paid; `refund`: your net payment into a market resolved INVALID (UC-16), what your
+            buys cost minus what your sales returned, never below zero (your shares of it are voided); `returned`: what
+            the bot account of a market you funded held (for INVALID, the rest after the refunds)
+        amountMicro:
+          $ref: '#/components/schemas/Microcredits'
+        outcome:
+          description: The market's outcome for `winnings`, `INVALID` for `refund`, null for `returned`
+          oneOf:
+            - $ref: '#/components/schemas/Outcome'
+            - type: 'null'
+        paidAt:
+          type: string
+          format: date-time
+    FundedMarket:
+      type: object
+      required: [marketId, question, status, fundingMicro, returnedMicro, settledAt]
+      properties:
+        marketId:
+          type: string
+          format: uuid
+        question:
+          type: ['string', 'null']
+        status:
+          oneOf:
+            - $ref: '#/components/schemas/MarketStatus'
+            - type: 'null'
+        fundingMicro:
+          oneOf:
+            - $ref: '#/components/schemas/Microcredits'
+            - type: 'null'
+        returnedMicro:
+          oneOf:
+            - $ref: '#/components/schemas/Microcredits'
+            - type: 'null'
+        settledAt:
+          type: ['string', 'null']
+          format: date-time
+    Portfolio:
+      type: object
+      required: [balanceMicro, withdrawableCredits, positions, recentTrades, payouts, fundedMarkets]
+      properties:
+        balanceMicro:
+          $ref: '#/components/schemas/Microcredits'
+        withdrawableCredits:
+          type: integer
+          minimum: 0
+          description: Whole credits a withdrawal may take now
+        positions:
+          type: array
+          items:
+            $ref: '#/components/schemas/PortfolioPosition'
+        recentTrades:
+          type: array
+          items:
+            $ref: '#/components/schemas/TradeEntry'
+        payouts:
+          type: array
+          items:
+            $ref: '#/components/schemas/PayoutEntry'
+        fundedMarkets:
+          description: Tenant admins only; null for traders
+          oneOf:
+            - type: array
+              items:
+                $ref: '#/components/schemas/FundedMarket'
+            - type: 'null'
+    Problem:
+      type: object
+      description: RFC 9457 problem details; extension members as the codes describe
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          examples: ['urn:chance:problem:insufficient-liquidity']
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        code:
+          type: string
+          examples: [insufficient_credits, insufficient_liquidity, insufficient_shares, market_not_open, price_limit_exceeded, proceeds_below_minimum, tenant_not_ready]
+        errors:
+          type: array
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+        maxAmount:
+          type: integer
+          minimum: 0
+        maxSharesMicro:
+          type: integer
+          minimum: 0
+          description: insufficient_liquidity of a sale (UC-08), the most shares of the other side the offers hold
+        withdrawableCredits:
+          type: integer
+          minimum: 0
+        heldMicro:
+          type: integer
+          minimum: 0
+          description: insufficient_shares (UC-08), the shares of the side the position holds
+        proceedsMicro:
+          type: integer
+          minimum: 0
+          description: proceeds_below_minimum (UC-08), what the sale would return now
+        minProceedsMicro:
+          type: integer
+          minimum: 1
+          description: proceeds_below_minimum (UC-08), the minimum in force (1 when the request named none)
+        quote:
+          description: A fresh quote; a Quote for price_limit_exceeded (orders), a SaleQuote for proceeds_below_minimum (sales)
+          oneOf:
+            - $ref: '#/components/schemas/Quote'
+            - $ref: '#/components/schemas/SaleQuote'
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          examples: [ok]

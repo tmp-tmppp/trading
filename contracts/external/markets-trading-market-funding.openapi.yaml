@@ -1,0 +1,180 @@
+openapi: 3.1.0
+info:
+  title: Chance trading market funding (expected by markets)
+  version: 0.1.0
+  description: |
+    What the markets service expects from trading's internal funding endpoint (plan DM-19, the opening saga). This is
+    markets' side of the agreement, written for trading to implement; trading's own contract replaces it once it
+    exists.
+
+    - Called only by the markets service, service to service, with a bearer token from the identity provider's
+      client-credentials grant (client `markets`). The endpoint is not routed by the gateway.
+    - It takes `amount` credits from the creator's account in the tenant and books them as the market's funding.
+    - `Idempotency-Key` is the market id. markets repeats a call whose outcome it did not learn (timeouts, network
+      errors, 5xx) with the same key and body, for as long as it takes; a repeat of a funded key must never take the
+      credits twice. 201 is the first funding, 200 a repeat of a funded key.
+    - Only a completed funding is stored under the key. An answer that took nothing (409 `insufficient_credits`, and
+      any other refusal: 400, 401, 403, 404, 422) is not stored, so a later call with the same key and body is decided
+      anew. A market that went back to draft after `insufficient_credits` is opened again with the same key (its id)
+      after the creator topped up, and is funded then; it is not answered with the old refusal.
+    - Authentication is checked first, then the key: a funded key always answers 200 to a valid token. A repeat that
+      arrives while the first call with the same key is still being processed answers 409 with code
+      `idempotency_in_progress` (or 503 with `Retry-After`), which markets retries; it is never a refusal.
+    - markets reads the status and, for 409, the problem `code`: 200 or 201 open the market; 409 with code
+      `insufficient_credits` puts it back in draft; any other 4xx (400, 401, 403, 404, 409 with another code, 422)
+      puts it back in draft as rejected, except that a 401 or 403 to a repeat (a call after one whose outcome was
+      not learned) leaves the market opening and is retried, because that answer says nothing about the first call;
+      408, 429, 409 `idempotency_in_progress` and 5xx are retried and, if they persist, leave the outcome unknown.
+    - Units: 1 credit, the same positive integer as payments' `amount`.
+servers:
+  - url: http://trading:8081
+    description: |
+      trading's internal Kubernetes service, on its internal port (not the public one, which the gateway routes; a
+      NetworkPolicy filters by port). trading serves /v1/internal/market-funding on this port; the chart value
+      `trading.port` of markets must equal it.
+security:
+  - serviceToken: []
+
+paths:
+  /v1/internal/market-funding:
+    post:
+      operationId: fundMarket
+      summary: Take a market's funding from its creator
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: The market id; the same key with the same body always means the same funding
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MarketFundingRequest'
+      responses:
+        '201':
+          description: Funded now
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketFunding'
+        '200':
+          description: Funded before by a call with the same key (a repeat); nothing was taken again
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketFunding'
+        '400':
+          description: The request is invalid (markets treats it as rejected)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401':
+          description: The service token is missing or invalid (rejected; to a repeat of a call whose outcome was not learned, markets retries instead)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          description: The token is not the markets service's (rejected; to a repeat of a call whose outcome was not learned, markets retries instead)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: The creator has no account in the tenant (rejected)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: |
+            The creator's balance is lower than `amount`: code `insufficient_credits`, type
+            `urn:chance:problem:insufficient-credits`; nothing was taken, and the refusal is not stored under the key:
+            the same key and body are decided anew when markets opens the market again after a top-up.
+            Code `idempotency_in_progress`: the first call with this key is still being processed; markets retries.
+            A 409 with another code is treated as rejected.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: The key was used before with another body (code `idempotency_key_reused`; rejected)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          description: Trading cannot take the funding now; markets retries with the same key
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+components:
+  securitySchemes:
+    serviceToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Access token of the client `markets` (OAuth 2.0 client credentials at the identity provider's token endpoint),
+        with trading as an audience. markets caches it until shortly before it expires.
+
+  schemas:
+    MarketFundingRequest:
+      type: object
+      additionalProperties: false
+      required: [marketId, tenantId, creatorId, amount]
+      properties:
+        marketId:
+          type: string
+          format: uuid
+          description: Equals the Idempotency-Key
+        tenantId:
+          type: string
+          format: uuid
+        creatorId:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Subject of the identity provider whose credits fund the market
+        amount:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+          description: Credits
+    MarketFunding:
+      type: object
+      required: [marketId, amount]
+      properties:
+        marketId:
+          type: string
+          format: uuid
+        amount:
+          type: integer
+          minimum: 1
+        fundedAt:
+          type: string
+          format: date-time
+    Problem:
+      type: object
+      description: RFC 9457 problem details
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          examples: ['urn:chance:problem:insufficient-credits']
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        code:
+          type: string
+          examples: [insufficient_credits]

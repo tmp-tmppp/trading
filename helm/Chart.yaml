@@ -1,0 +1,7 @@
+apiVersion: v2
+name: trading
+description: Credits, positions and trades of Chance, per tenant (market funding, orders against the market maker's offers, payouts, debits and refunds).
+type: application
+# Chart version: bump on every change to the chart. The image tag is set by the pipeline (sha-<commit>).
+version: 0.2.0
+appVersion: "0.1.0"

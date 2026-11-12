@@ -1,0 +1,158 @@
+# Defaults, safe for a local cluster. values-dev.yaml and values-prod.yaml override them; the pipeline sets
+# image.repository and image.tag (sha-<commit>) with --set-string and never puts secrets into values.
+
+image:
+  repository: docker.io/example/trading
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# Three ports, one Service. "port" is the public API and the health probes (the gateway routes /v1/trading); "internalPort"
+# is the internal API (funding, debits, the market maker), which the gateway never routes; "grpcPort" is the gRPC debit
+# of payments (REQ-17, ADR-023: contracts/trading-debit.proto, the same use case as POST /v1/internal/debits). A
+# NetworkPolicy filters by port, not by path (plan section 9), which is why each has its own port: markets' chart value
+# trading.port has to be this internalPort, and payments calls grpcPort as trading:8082.
+service:
+  port: 8080
+  internalPort: 8081
+  grpcPort: 8082
+
+# Metrics (REQ-20): GET /metrics is served on a port of its own, never on service.port, service.internalPort or
+# service.grpcPort, so that the gateway can never route it. The port is rendered as METRICS_PORT and as the container
+# port "metrics"; the Pod annotations prometheus.io/scrape, prometheus.io/port and prometheus.io/path tell Prometheus
+# where to scrape. The Service does not expose it.
+metrics:
+  port: 9464
+
+# Pod annotations (the prometheus.io ones come from metrics.port); the pipeline adds checksum/app-env so the Pods restart when the Secret changes.
+podAnnotations: {}
+
+# Secret settings (DATABASE_URL) come from this Secret as environment variables.
+# The pipeline creates it from the organization secret TRADING_ENV; it is optional so the chart renders without it.
+existingSecret: trading-env
+
+# Non-secret startup settings, rendered into a ConfigMap (all values are strings). Changing one restarts the Pods,
+# because the environment is read only at start. Every key is described in README.md. PORT, INTERNAL_PORT, GRPC_PORT and
+# RUNTIME_CONFIG_FILE are rendered by the chart from service and the volume mount, and the four runtime keys have their
+# own block below; SEED_CREDITS exists only for APP_ENV=local. The schema refuses all of them here, so one value never
+# has two sources.
+env:
+  APP_ENV: production
+  NATS_URL: nats://nats:4222
+  AUTH_JWKS_URL: http://identity:8080/realms/chance/protocol/openid-connect/certs
+  AUTH_ISSUER: http://localhost:8081/realms/chance
+  AUTH_AUDIENCE: chance
+  AUTH_ROLES_CLAIM: realm_access.roles
+  AUTH_TENANT_CLAIM: organization
+  # The internal API (port 8081): tokens of the same issuer and keys, this audience, and the client id (claim
+  # INTERNAL_CLIENT_CLAIM, Keycloak: azp) that names the calling service. Each internal endpoint admits exactly one of
+  # the three clients; any other client gets 403. The client ids must differ.
+  INTERNAL_AUTH_AUDIENCE: chance
+  INTERNAL_CLIENT_CLAIM: azp
+  MARKETS_CLIENT_ID: markets
+  PAYMENTS_CLIENT_ID: payments
+  MARKET_MAKER_CLIENT_ID: market-maker
+  DATABASE_POOL_MAX: "5"
+  OUTBOX_POLL_MS: "300"
+  # How long the TRADING stream keeps its messages, in days (1 to 365). The relay keeps its published outbox rows as long
+  # and the inbox a day longer, so every Chance service runs with the same value. 30 so that a service started later
+  # still sees the older events: lower it back once every consumer is live (lowering it deletes the older messages from
+  # the stream at the next start).
+  STREAM_MAX_AGE_DAYS: "30"
+  RUNTIME_CONFIG_POLL_MS: "10000"
+  # Drain after SIGTERM: readiness answers 503 and the Pod keeps serving for this long before it closes. It has to fit
+  # into terminationGracePeriodSeconds (30 in the Deployment) together with the 10 seconds a close may take.
+  SHUTDOWN_DELAY_MS: "5000"
+
+# Runtime configuration (ADR-037): the keys the service applies while it runs, without a restart. They are rendered
+# into the ConfigMap <release>-runtime, which the Pods mount as the directory /etc/trading/runtime (never as a subPath,
+# which would never update). The Pods do NOT restart when it changes: the kubelet refreshes the mounted file within
+# about a minute and the service reads it again every RUNTIME_CONFIG_POLL_MS. A key left out here keeps the
+# service's default (a deleted line undoes an override); the bounds are checked by the service, which keeps the value in
+# force for a key whose value is invalid (a typo in the ConfigMap never undoes a pause) and logs it.
+runtime:
+  LOG_LEVEL: info
+  # The largest amount of one order, in credits (the same unit as payments' amount; 1 to 1000000).
+  ORDER_AMOUNT_MAX: "100000"
+  # The most offers the market maker may rest per side of a market (1 to 50).
+  MAX_OFFERS_PER_SIDE: "10"
+  # "false" pauses new orders (503 orders_paused) while quotes, the portfolio and the internal API keep working; a
+  # retry of an order that already executed still answers 200 (REL-03).
+  ORDERS_ENABLED: "true"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+  limits:
+    memory: 256Mi
+
+#
+# timeoutSeconds: the readiness handler runs SELECT 1 on the same connection pool as the requests and may wait up to 3
+# seconds for a free connection (the pool's connectionTimeoutMillis), so its timeout is 4, not the kubelet's 1: under a
+# burst on one market a busy Pod must not leave the Service endpoints only because the probe queued behind orders.
+# Keep it below periodSeconds. Startup and liveness do not touch the database; 1 is the kubelet's default.
+probes:
+  startup:
+    path: /health/startup
+    periodSeconds: 2
+    timeoutSeconds: 1
+    failureThreshold: 30
+  readiness:
+    path: /health/ready
+    periodSeconds: 10
+    timeoutSeconds: 4
+    failureThreshold: 3
+  liveness:
+    path: /health/live
+    periodSeconds: 10
+    timeoutSeconds: 1
+    failureThreshold: 3
+
+# The public port admits only the API gateway (and the smoke test of this release); the internal port admits only the
+# Pods whose label app.kubernetes.io/name is in internal.allowedApps (markets, payments, market-maker), and the gRPC
+# port only those in grpc.allowedApps (payments). The Pods reach
+# only what they need: PostgreSQL, NATS, the identity provider (signing keys) and DNS; trading calls no other service.
+# Needs a network policy engine in the cluster (plan section 9). The sources and destinations are Pods of the
+# release's own namespace, selected by the labels below: check them against the Pods of the other services and the
+# shared PostgreSQL, NATS and identity before enabling it, because a wrong label blocks the service. A managed
+# PostgreSQL outside the cluster would need an ipBlock rule instead.
+networkPolicy:
+  enabled: false
+  gatewayNamespaceLabels:
+    kubernetes.io/metadata.name: gateway
+  gatewayPodLabels:
+    app.kubernetes.io/name: traefik
+  # The namespace of Prometheus (selected by its kubernetes.io/metadata.name label): admitted on the metrics port only.
+  metrics:
+    namespace: monitoring
+  internal:
+    # Values of the label app.kubernetes.io/name of the callers of the internal port.
+    allowedApps:
+      - markets
+      - payments
+      - market-maker
+  grpc:
+    # Values of the label app.kubernetes.io/name of the callers of the gRPC port: payments alone.
+    allowedApps:
+      - payments
+  egress:
+    postgres:
+      podLabels:
+        app.kubernetes.io/name: postgres
+      port: 5432
+    nats:
+      podLabels:
+        app.kubernetes.io/name: nats
+      port: 4222
+    keycloak:
+      podLabels:
+        app.kubernetes.io/name: identity
+      port: 8080
+    dnsNamespaceLabels:
+      kubernetes.io/metadata.name: kube-system
+
+# Smoke test run by "helm test" after every deploy: asks the readiness endpoint through the Service.
+smokeTest:
+  image: docker.io/library/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4

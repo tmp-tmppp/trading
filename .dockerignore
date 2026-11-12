@@ -1,0 +1,16 @@
+.git
+.github
+node_modules
+dist
+coverage
+reports
+helm
+tests
+contracts/*
+!contracts/trading-debit.proto
+compose.yaml
+Dockerfile
+.dockerignore
+.gitignore
+.env
+*.md

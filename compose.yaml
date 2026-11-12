@@ -1,0 +1,80 @@
+# Local dependencies of the trading service: PostgreSQL 18 and NATS with JetStream.
+#   docker compose up -d                  # only the two dependencies (the default)
+#   npm run build
+#   APP_ENV=local DATABASE_URL=postgres://trading:trading@localhost:5432/trading NATS_URL=nats://localhost:4222 npm start
+# or the service itself in a container (the only part that builds the image; the profile keeps it out of the default):
+#   docker compose --profile app up --build
+# Trading calls no other service, so nothing else is needed to start it. Tokens are still verified against
+# AUTH_JWKS_URL (default: a Keycloak of the identity repository on the host, port 8081); the public API answers on
+# 8080, the internal API on 8091 and the gRPC debit on 8092 of the host (INTERNAL_PORT is 8081 and GRPC_PORT 8082 inside
+# the container; a local run outside the container defaults to 8091 for the internal API for the same reason and to
+# 8082 for gRPC).
+# With a database, a tenant's schema is created when its TenantCreated event arrives from the tenants service (start
+# tenants against the same NATS), or on the first funding call, debit or market or payment event naming it; a request of
+# a user for a tenant that is not there yet answers 503 tenant_not_ready. Test credits: `npm run seed:credits` (see README.md).
+# The password below is a local development value only; real ones live in the Secret trading-env.
+name: chance-trading
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_DB: trading
+      POSTGRES_USER: trading
+      POSTGRES_PASSWORD: trading # hooks:allow local development only
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading -d trading"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nats:
+    image: nats:2.15.2-alpine
+    command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - nats-data:/data
+
+  trading:
+    profiles: ["app"]
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    environment:
+      APP_ENV: local
+      PORT: "8080"
+      INTERNAL_PORT: "8081"
+      GRPC_PORT: "8082"
+      DATABASE_URL: postgres://trading:trading@postgres:5432/trading # hooks:allow local development only
+      NATS_URL: nats://nats:4222
+      # The issuer is what the tokens say; the keys are fetched from the host's Keycloak.
+      AUTH_ISSUER: ${AUTH_ISSUER:-http://localhost:8081/realms/chance}
+      AUTH_JWKS_URL: ${AUTH_JWKS_URL:-http://host.docker.internal:8081/realms/chance/protocol/openid-connect/certs}
+      AUTH_AUDIENCE: ${AUTH_AUDIENCE:-chance}
+      # Test credits for a local tenant and user, granted once at startup (see README.md): <tenantId>/<userId>=<credits>.
+      SEED_CREDITS: ${SEED_CREDITS:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8091:8081"
+      - "127.0.0.1:8092:8082"
+    healthcheck:
+      # The image has no curl or wget; Node 24 has fetch.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health/ready').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+volumes:
+  postgres-data:
+  nats-data:

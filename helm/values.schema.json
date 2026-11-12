@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Values of the trading chart",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["image", "replicaCount", "service", "metrics", "existingSecret", "env", "runtime", "resources", "probes", "networkPolicy", "smokeTest"],
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string", "minLength": 1 },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "replicaCount": { "type": "integer", "minimum": 1, "maximum": 5 },
+    "service": {
+      "type": "object",
+      "description": "port: the public API and the health probes; internalPort: the internal API of markets, payments and market-maker; grpcPort: the gRPC debit of payments (contracts/trading-debit.proto). The three must differ (the chart refuses equal ports).",
+      "additionalProperties": false,
+      "required": ["port", "internalPort", "grpcPort"],
+      "properties": {
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "internalPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "grpcPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "description": "GET /metrics is served on this port, never on service.port, service.internalPort or service.grpcPort (the template refuses equal ports).",
+      "additionalProperties": false,
+      "required": ["port"],
+      "properties": { "port": { "type": "integer", "minimum": 1, "maximum": 65535 } }
+    },
+    "podAnnotations": {
+      "type": "object",
+      "description": "The prometheus.io/* annotations are set by the chart from metrics.port; they cannot be set here.",
+      "propertyNames": { "not": { "pattern": "^prometheus\\.io/" } },
+      "additionalProperties": { "type": "string" }
+    },
+    "existingSecret": { "type": "string", "minLength": 1 },
+    "env": {
+      "type": "object",
+      "description": "Non-secret startup settings only. Secrets belong in the Secret named by existingSecret; PORT, INTERNAL_PORT, GRPC_PORT, METRICS_PORT and RUNTIME_CONFIG_FILE are rendered by the chart; the runtime keys have their own block; SEED_CREDITS exists only for APP_ENV=local, which a cluster must never use (it replaces the database and NATS with memory).",
+      "propertyNames": {
+        "pattern": "^[A-Z][A-Z0-9_]*$",
+        "not": {
+          "enum": [
+            "DATABASE_URL",
+            "PORT",
+            "INTERNAL_PORT",
+            "GRPC_PORT",
+            "METRICS_PORT",
+            "RUNTIME_CONFIG_FILE",
+            "SEED_CREDITS",
+            "LOG_LEVEL",
+            "ORDER_AMOUNT_MAX",
+            "MAX_OFFERS_PER_SIDE",
+            "ORDERS_ENABLED"
+          ]
+        }
+      },
+      "properties": {
+        "APP_ENV": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$", "not": { "const": "local" } },
+        "DATABASE_POOL_MAX": { "type": "string", "pattern": "^([1-9]|[1-4][0-9]|50)$", "description": "1 to 50, as src/config.ts accepts" },
+        "SHUTDOWN_DELAY_MS": { "type": "string", "pattern": "^(0|[1-9][0-9]{0,3}|1[0-4][0-9]{3}|15000)$", "description": "0 to 15000, as src/config.ts accepts" },
+        "STREAM_MAX_AGE_DAYS": { "type": "string", "pattern": "^([1-9][0-9]?|[12][0-9]{2}|3[0-5][0-9]|36[0-5])$", "description": "1 to 365 (days), as src/config.ts accepts" },
+        "OUTBOX_POLL_MS": { "type": "string", "pattern": "^(5[0-9]|[6-9][0-9]|[1-9][0-9]{2,3}|[1-5][0-9]{4}|60000)$", "description": "50 to 60000, as src/config.ts accepts" },
+        "RUNTIME_CONFIG_POLL_MS": { "type": "string", "pattern": "^([1-9][0-9]{3}|[1-9][0-9]{4,5}|[12][0-9]{6}|3[0-5][0-9]{5}|3600000)$", "description": "1000 to 3600000, as src/config.ts accepts" }
+      },
+      "additionalProperties": { "type": "string" }
+    },
+    "runtime": {
+      "type": "object",
+      "description": "The keys the service applies while it runs (ADR-037); rendered into the ConfigMap <release>-runtime, whose change does not restart the Pods. Values are strings.",
+      "additionalProperties": false,
+      "properties": {
+        "LOG_LEVEL": { "type": "string", "enum": ["fatal", "error", "warn", "info", "debug", "trace", "silent"] },
+        "ORDER_AMOUNT_MAX": { "type": "string", "pattern": "^([1-9][0-9]{0,5}|1000000)$", "description": "1 to 1000000 credits, as src/config.ts accepts" },
+        "MAX_OFFERS_PER_SIDE": { "type": "string", "pattern": "^([1-9]|[1-4][0-9]|50)$", "description": "1 to 50, as src/config.ts accepts" },
+        "ORDERS_ENABLED": { "type": "string", "enum": ["true", "false"] }
+      }
+    },
+    "resources": { "type": "object" },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startup", "readiness", "liveness"],
+      "properties": {
+        "startup": { "$ref": "#/definitions/probe" },
+        "readiness": { "$ref": "#/definitions/probe" },
+        "liveness": { "$ref": "#/definitions/probe" }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "gatewayNamespaceLabels", "gatewayPodLabels", "metrics", "internal", "grpc", "egress"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "gatewayNamespaceLabels": { "$ref": "#/definitions/labels" },
+        "gatewayPodLabels": { "$ref": "#/definitions/labels" },
+        "metrics": {
+          "type": "object",
+          "description": "The namespace of Prometheus, admitted on the metrics port only.",
+          "additionalProperties": false,
+          "required": ["namespace"],
+          "properties": { "namespace": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$" } }
+        },
+        "internal": {
+          "type": "object",
+          "description": "Who may reach the internal port: Pods whose label app.kubernetes.io/name is one of allowedApps.",
+          "additionalProperties": false,
+          "required": ["allowedApps"],
+          "properties": {
+            "allowedApps": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "type": "string", "pattern": "^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$" }
+            }
+          }
+        },
+        "grpc": {
+          "type": "object",
+          "description": "Who may reach the gRPC port: Pods whose label app.kubernetes.io/name is one of allowedApps (payments only: the debit is the one call over gRPC).",
+          "additionalProperties": false,
+          "required": ["allowedApps"],
+          "properties": {
+            "allowedApps": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "type": "string", "pattern": "^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$" }
+            }
+          }
+        },
+        "egress": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["postgres", "nats", "keycloak", "dnsNamespaceLabels"],
+          "properties": {
+            "postgres": { "$ref": "#/definitions/destinationWithPort" },
+            "nats": { "$ref": "#/definitions/destinationWithPort" },
+            "keycloak": { "$ref": "#/definitions/destinationWithPort" },
+            "dnsNamespaceLabels": { "$ref": "#/definitions/labels" }
+          }
+        }
+      }
+    },
+    "smokeTest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image"],
+      "properties": { "image": { "type": "string", "minLength": 1 } }
+    }
+  },
+  "definitions": {
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "periodSeconds", "timeoutSeconds", "failureThreshold"],
+      "properties": {
+        "path": { "type": "string", "pattern": "^/" },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 60, "description": "Keep it below periodSeconds. The kubelet default is 1." },
+        "failureThreshold": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "labels": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "string" }
+    },
+    "destinationWithPort": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["podLabels", "port"],
+      "properties": {
+        "podLabels": { "$ref": "#/definitions/labels" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    }
+  }
+}

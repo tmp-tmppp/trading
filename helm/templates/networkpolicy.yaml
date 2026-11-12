@@ -1,0 +1,109 @@
+{{- if .Values.networkPolicy.enabled }}
+# Ingress, per port: the public port (http) admits only the API gateway, and the smoke test Pod of this release; the
+# internal port (internal) admits only Pods whose label app.kubernetes.io/name is in networkPolicy.internal.allowedApps
+# (markets, payments, market-maker), never the gateway; the gRPC port (grpc) admits only the Pods in
+# networkPolicy.grpc.allowedApps (payments); the metrics port (metrics) admits only the monitoring namespace
+# (networkPolicy.metrics.namespace). A NetworkPolicy filters by port, not by path (plan section 9), which is why
+# the APIs are on separate ports. The sources are Pods of this namespace.
+# Egress: PostgreSQL, NATS, the identity provider (the signing keys of the tokens) and DNS; everything else is denied
+# (trading calls no other service). The policy selects the service's Pods only, not the smoke test Pod, which
+# carries the same selector labels but must reach the Service.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "trading.fullname" . }}
+  labels:
+    {{- include "trading.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "trading.selectorLabels" . | nindent 6 }}
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: NotIn
+        values: ["smoke-test"]
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # The public API and the health probes.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.gatewayNamespaceLabels | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.gatewayPodLabels | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: smoke-test
+      ports:
+        - port: http
+          protocol: TCP
+    # The internal API: funding (markets), debits (payments), the book and offers (market-maker). Which of the three
+    # may call which endpoint is decided again by the service, from the client id of the token.
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  {{- toYaml .Values.networkPolicy.internal.allowedApps | nindent 18 }}
+      ports:
+        - port: internal
+          protocol: TCP
+    # The gRPC debit: payments alone (networkPolicy.grpc.allowedApps), never markets, the market maker or the gateway.
+    # The service decides again from the client id of the token: only the client `payments` may call it.
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  {{- toYaml .Values.networkPolicy.grpc.allowedApps | nindent 18 }}
+      ports:
+        - port: grpc
+          protocol: TCP
+    # The metrics port: the monitoring namespace (networkPolicy.metrics.namespace) only; it scrapes nothing else.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.metrics.namespace | quote }}
+      ports:
+        - port: metrics
+          protocol: TCP
+  egress:
+    # PostgreSQL: the service's database on the shared server (DM-01).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.egress.postgres.podLabels | nindent 14 }}
+      ports:
+        - port: {{ .Values.networkPolicy.egress.postgres.port }}
+          protocol: TCP
+    # NATS: the outbox relay publishes, the three consumers read.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.egress.nats.podLabels | nindent 14 }}
+      ports:
+        - port: {{ .Values.networkPolicy.egress.nats.port }}
+          protocol: TCP
+    # The identity provider: the signing keys of the tokens (trading asks it for nothing else).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.egress.keycloak.podLabels | nindent 14 }}
+      ports:
+        - port: {{ .Values.networkPolicy.egress.keycloak.port }}
+          protocol: TCP
+    # DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.egress.dnsNamespaceLabels | nindent 14 }}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+{{- end }}

@@ -1,0 +1,536 @@
+openapi: 3.1.0
+info:
+  title: Chance trading internal API
+  version: 0.1.0
+  description: |
+    The internal port of trading (8081 in the cluster): the three synchronous calls other services make to trading
+    (ADR-017, ADR-019). Not routed by the gateway (`/v1/internal` is blocked there); the NetworkPolicy admits only the
+    pods of markets, payments and market-maker to this port.
+
+    - Every call carries a bearer token of the identity provider's client-credentials grant, verified like user tokens
+      (signature, issuer, `exp` required) with the audience `INTERNAL_AUTH_AUDIENCE` (default `chance`). The client id
+      claim (`azp`) names the caller, and each endpoint admits exactly one client: `markets` for market funding,
+      `payments` for debits, `market-maker` for the bot endpoints. Another client gets `403`.
+    - The tenant never comes from the token: the funding and the debit name it in the body (from markets' market and
+      payments' withdrawal record), and the bot endpoints take it from the market (plan section 9).
+    - **Units.** `amount` is whole credits (payments' unit, 1 to 1 000 000). The bot endpoints use micro-units:
+      microcredits, microshares, and prices as microcredits per share on the 0.01 grid (`10000` .. `990000`).
+    - Errors are RFC 9457 `application/problem+json` with a stable `code` (type `urn:chance:problem:<code with dashes>`).
+    - `market-funding` implements markets' expectation (markets' `contracts/outgoing/trading-market-funding.openapi.yaml`)
+      and `debits` payments' proposal (payments' `contracts/trading-debit.openapi.yaml`), status codes and bodies
+      unchanged; the debit adds one answer payments never provokes: `422 idempotency_key_reused` for a `withdrawalId`
+      that arrives again with another user, tenant or amount.
+servers:
+  - url: http://trading:8081
+    description: trading's internal Kubernetes service port (a local run listens on 8091)
+tags:
+  - name: Funding
+    description: Called by markets when an admin opens a market (DM-19)
+  - name: Debits
+    description: Called by payments in the withdrawal saga (FL-C)
+  - name: MarketMaker
+    description: Called by the market maker (ADR-019, ADR-041)
+security:
+  - serviceToken: []
+
+paths:
+  /v1/internal/market-funding:
+    post:
+      tags: [Funding]
+      operationId: fundMarket
+      summary: Take a market's funding from its creator (client `markets`)
+      description: |
+        Takes `amount` credits from the creator's account and books them as pairs in the market's bot account
+        (ADR-013), creates or completes trading's copy of the market and publishes MarketFunded, in one transaction.
+        `Idempotency-Key` is the market id. Authentication first, then the key: a funded key always answers `200` with
+        the stored funding. Only a completed funding is stored: a refusal (`409`, `422`, any `4xx`) leaves nothing, so
+        the same key and body are decided anew later. A concurrent repeat waits for the first call and then answers
+        `200`; `409` with code `idempotency_in_progress` is therefore never sent. A creator without an account in the
+        tenant has a balance of 0 and gets `409 insufficient_credits` (404 is not used). A tenant whose TenantCreated
+        trading has not seen (for example one created before trading's consumer existed) is provisioned on this first
+        call from markets, so `503 tenant_not_ready` is not sent here.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: The market id; must equal `marketId` of the body (else 400)
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MarketFundingRequest'
+      responses:
+        '201':
+          description: Funded now
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketFunding'
+        '200':
+          description: Funded before by a call with the same key and body; nothing was taken again
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketFunding'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: |
+            Code `insufficient_credits` (type `urn:chance:problem:insufficient-credits`): the creator's balance is lower
+            than `amount`; nothing was taken and nothing is stored. Code `market_closed`: trading already processed
+            MarketClosed or MarketResolved of this market, so it cannot be funded (markets treats it as rejected).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: The market was funded before with another body (code `idempotency_key_reused`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/internal/debits:
+    post:
+      tags: [Debits]
+      operationId: debitCredits
+      summary: Debit credits for a withdrawal, idempotent by withdrawalId (client `payments`)
+      description: |
+        payments' proposal, unchanged. Both answers are definitive and stored under `withdrawalId`: a repeat answers
+        `200` again for a debit that was made, and `409` again for one refused for too few credits. An optional
+        `Idempotency-Key` header must equal `withdrawalId` (plan REL-03); payments sends it. A user without an account
+        has a balance of 0. Every `409` of this endpoint means too few credits (payments reads any 409 so); anything
+        that is not definitive is `503`. trading records the tenant of every `withdrawalId` across tenants, so the same
+        `withdrawalId` with another `tenantId` is `422`, never a second debit. An unknown tenant is provisioned on the
+        first call from payments (no `tenant_not_ready`). The same debit is also offered over gRPC on port 8082
+        (`trading-debit.proto`, REQ-17): the same use case and the same idempotency store, so a repeat over the other
+        transport answers the stored result.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DebitRequest'
+      responses:
+        '200':
+          description: The credits are debited (now, or by an earlier call with the same `withdrawalId`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebitResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: The user's credits are too few (code `insufficient_credits`); definitive for this `withdrawalId`
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: The `withdrawalId` was debited or refused before for another body (code `idempotency_key_reused`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/internal/markets:
+    get:
+      tags: [MarketMaker]
+      operationId: listOpenMarkets
+      summary: Open markets of every tenant (client `market-maker`)
+      description: The bot's start and periodic check (ADR-041). Ordered by tenant id, then market id.
+      parameters:
+        - name: status
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [open]
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 512
+      responses:
+        '200':
+          description: One page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BotMarketPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/internal/markets/{marketId}/bot-book:
+    get:
+      tags: [MarketMaker]
+      operationId: getBotBook
+      summary: The bot account's holdings, its resting offers, the market's trade sequence and the offer limit per side (client `market-maker`)
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+      responses:
+        '200':
+          description: The book
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BotBook'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/internal/markets/{marketId}/bot-orders:
+    put:
+      tags: [MarketMaker]
+      operationId: replaceBotOrders
+      summary: Replace all of the bot's offers of the market in one transaction (client `market-maker`, ADR-041)
+      description: |
+        Acts only on this market's bot account. `basedOnSequence` must equal the market's current trade sequence: send
+        `tradeSequence` of the book you priced on (GET bot-book), never its `offersPricedOnSequence`. Otherwise
+        `409 stale_sequence` (a trade happened since: read the book again). Offers are accepted while trading's copy is
+        `funded` or `open`: markets funds a market before it publishes MarketOpened, so the market maker may place its
+        first offers before trading has processed MarketOpened; orders wait for `open`. `409 market_not_open` means the
+        market is closed, resolved, unfunded or past its close time: stop quoting it (do not retry). Per side the offers may not exceed what the
+        bot account holds plus the pairs its credits can create (`409 insufficient_holdings`). An empty list cancels
+        every offer. Prices outside 0.01 .. 0.99 or off the grid, a repeated price per side, more than
+        `MAX_OFFERS_PER_SIDE` offers per side (the book's `maxOffersPerSide`), or a cheapest YES plus cheapest NO below
+        1 credit (`crossed_offers`) are `400`.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplaceBotOrdersRequest'
+      responses:
+        '200':
+          description: The new book
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BotBook'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            `stale_sequence` (`tradeSequence` is the current one), `market_not_open` (closed, resolved, unfunded or past
+            its close time, with `status`; MarketClosed cancels every offer), `insufficient_holdings` (`side`, `offeredMicro`,
+            `availableMicro`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+components:
+  securitySchemes:
+    serviceToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Client-credentials access token of `markets`, `payments` or `market-maker` (claim `azp`)
+
+  parameters:
+    MarketId:
+      name: marketId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: The request is invalid (code `validation_failed`, or `crossed_offers`); `errors` names the fields
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: The service token is missing or invalid
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: The token belongs to another client than the endpoint admits (code `forbidden`)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Trading knows no such market (code `not_found`)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: |
+        Not definitive; repeat with the same request after `Retry-After`: `identity_provider_unavailable`,
+        `concurrent_update`. An unknown tenant is provisioned on first sight from markets or payments, so
+        `tenant_not_ready` is not sent on this port.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Side:
+      type: string
+      enum: ['YES', 'NO']
+    MarketFundingRequest:
+      type: object
+      additionalProperties: false
+      required: [marketId, tenantId, creatorId, amount]
+      properties:
+        marketId:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        creatorId:
+          type: string
+          minLength: 1
+          maxLength: 255
+        amount:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+    MarketFunding:
+      type: object
+      required: [marketId, amount, fundedAt]
+      properties:
+        marketId:
+          type: string
+          format: uuid
+        amount:
+          type: integer
+          minimum: 1
+        fundedAt:
+          type: string
+          format: date-time
+    DebitRequest:
+      type: object
+      additionalProperties: false
+      required: [withdrawalId, tenantId, userId, amount]
+      properties:
+        withdrawalId:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+          minLength: 1
+          maxLength: 255
+        amount:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+    DebitResult:
+      type: object
+      required: [withdrawalId, status]
+      properties:
+        withdrawalId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [debited]
+    BotMarket:
+      type: object
+      required: [marketId, tenantId, status, version, closeTime, startingPriceMicro, fundingMicro, tradeSequence]
+      properties:
+        marketId:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [funded, open, closed, resolved]
+        version:
+          type: integer
+          minimum: 0
+        closeTime:
+          type: ['string', 'null']
+          format: date-time
+        startingPriceMicro:
+          type: ['integer', 'null']
+          minimum: 10000
+          maximum: 990000
+        fundingMicro:
+          type: ['integer', 'null']
+          minimum: 1
+        tradeSequence:
+          type: integer
+          minimum: 0
+    BotMarketPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/BotMarket'
+        nextCursor:
+          type: ['string', 'null']
+    Offer:
+      type: object
+      additionalProperties: false
+      required: [side, priceMicro, sharesMicro]
+      properties:
+        side:
+          $ref: '#/components/schemas/Side'
+        priceMicro:
+          type: integer
+          minimum: 10000
+          maximum: 990000
+          multipleOf: 10000
+        sharesMicro:
+          type: integer
+          minimum: 1
+          maximum: 9007199254740991
+    BotBook:
+      type: object
+      required: [market, holdings, offers, tradeSequence, offersPricedOnSequence, maxOffersPerSide]
+      properties:
+        market:
+          $ref: '#/components/schemas/BotMarket'
+        holdings:
+          type: object
+          required: [balanceMicro, yesMicro, noMicro]
+          properties:
+            balanceMicro:
+              type: integer
+              minimum: 0
+            yesMicro:
+              type: integer
+              minimum: 0
+            noMicro:
+              type: integer
+              minimum: 0
+        offers:
+          type: array
+          items:
+            $ref: '#/components/schemas/Offer'
+        tradeSequence:
+          type: integer
+          minimum: 0
+          description: The market's current trade sequence (equals `market.tradeSequence`); send it as `basedOnSequence` of PUT bot-orders
+        offersPricedOnSequence:
+          type: ['integer', 'null']
+          minimum: 0
+          description: |
+            The trade sequence the resting offers were priced on, null when there are none. Information only: a fill
+            keeps it, so after a trade it is lower than `tradeSequence`; a PUT that sends it gets `409 stale_sequence`.
+        maxOffersPerSide:
+          type: integer
+          minimum: 1
+          maximum: 50
+          description: |
+            The most offers per side trading accepts now: its runtime `MAX_OFFERS_PER_SIDE`, read when the book is
+            answered (it can change without a restart). A PUT bot-orders with more offers on one side is `400`, so post at
+            most this many levels per side.
+    ReplaceBotOrdersRequest:
+      type: object
+      additionalProperties: false
+      required: [basedOnSequence, offers]
+      properties:
+        basedOnSequence:
+          type: integer
+          minimum: 0
+          description: The `tradeSequence` of the book the offers were priced on (GET bot-book); must equal the market's current one
+        offers:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/Offer'
+    Problem:
+      type: object
+      description: RFC 9457 problem details
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        code:
+          type: string
+          examples: [insufficient_credits, market_closed, idempotency_key_reused, stale_sequence, insufficient_holdings, market_not_open]
+        errors:
+          type: array
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+        tradeSequence:
+          type: integer
+          minimum: 0
